@@ -22,8 +22,6 @@ jobs:
       - name: Generate Android project
         run: |
           mkdir -p app/src/main/java/com/example/airplanetoggler
-          mkdir -p app/src/main/res/xml
-          mkdir -p app/src/main/res/values
 
           cat > settings.gradle.kts <<'EOF'
           pluginManagement {
@@ -67,8 +65,8 @@ jobs:
                   applicationId = "com.example.airplanetoggler"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "2.0"
+                  versionCode = 3
+                  versionName = "3.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -78,27 +76,19 @@ jobs:
                   jvmTarget = "17"
               }
           }
-          EOF
-
-          cat > app/src/main/res/values/strings.xml <<'EOF'
-          <resources>
-              <string name="service_desc">يفتح الإعدادات السريعة ويضغط على زر وضع الطائرة تلقائياً كل فترة محددة.</string>
-          </resources>
-          EOF
-
-          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
-          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-              android:accessibilityEventTypes="typeWindowStateChanged"
-              android:accessibilityFeedbackType="feedbackGeneric"
-              android:accessibilityFlags="flagRetrieveInteractiveWindows"
-              android:isAccessibilityTool="true"
-              android:canRetrieveWindowContent="true"
-              android:description="@string/service_desc"
-              android:notificationTimeout="100"/>
+          dependencies {
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
           EOF
 
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
               <application
                   android:label="Airplane Toggler"
@@ -112,17 +102,21 @@ jobs:
                   </activity>
 
                   <service
-                      android:name=".AirplaneService"
-                      android:exported="true"
-                      android:label="Airplane Toggler"
-                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
-                      <intent-filter>
-                          <action android:name="android.accessibilityservice.AccessibilityService"/>
-                      </intent-filter>
-                      <meta-data
-                          android:name="android.accessibilityservice"
-                          android:resource="@xml/accessibility_config"/>
+                      android:name=".ToggleService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="airplane_mode_toggle"/>
                   </service>
+
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:multiprocess="false"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"/>
               </application>
           </manifest>
           EOF
@@ -130,17 +124,47 @@ jobs:
           cat > app/src/main/java/com/example/airplanetoggler/MainActivity.kt <<'EOF'
           package com.example.airplanetoggler
 
+          import android.Manifest
           import android.app.Activity
           import android.content.Intent
+          import android.content.pm.PackageManager
           import android.os.Bundle
-          import android.provider.Settings
           import android.text.InputType
           import android.widget.*
+          import rikka.shizuku.Shizuku
 
           class MainActivity : Activity() {
 
+              private lateinit var status: TextView
+              private val listener = Shizuku.OnRequestPermissionResultListener { _, _ -> refresh() }
+
+              private fun ready(): Boolean = try {
+                  Shizuku.pingBinder() &&
+                      Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+              } catch (e: Throwable) {
+                  false
+              }
+
+              private fun refresh() {
+                  status.text = try {
+                      when {
+                          !Shizuku.pingBinder() -> "Shizuku غير مشغّل. شغّله من تطبيق Shizuku أولاً"
+                          Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED ->
+                              "الإذن غير ممنوح. اضغط (منح إذن Shizuku)"
+                          else -> "جاهز ✓"
+                      }
+                  } catch (e: Throwable) {
+                      "Shizuku غير متاح"
+                  }
+              }
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  try {
+                      Shizuku.addRequestPermissionResultListener(listener)
+                  } catch (e: Throwable) {
+                  }
 
                   val pad = (16 * resources.displayMetrics.density).toInt()
                   val root = LinearLayout(this).apply {
@@ -148,12 +172,8 @@ jobs:
                       setPadding(pad, pad, pad, pad)
                   }
 
-                  val info = TextView(this).apply {
-                      text = "1) فعّل الخدمة من إعدادات إمكانية الوصول\n" +
-                          "2) أضف زر وضع الطائرة إلى الإعدادات السريعة\n" +
-                          "3) اترك الشاشة مفتوحة وغير مقفلة"
-                  }
-                  val access = Button(this).apply { text = "فتح إعدادات إمكانية الوصول" }
+                  status = TextView(this).apply { textSize = 18f }
+                  val grant = Button(this).apply { text = "منح إذن Shizuku" }
                   val onField = EditText(this).apply {
                       hint = "مدة وضع الطائرة مفعّلاً (بالثواني)"
                       inputType = InputType.TYPE_CLASS_NUMBER
@@ -162,143 +182,163 @@ jobs:
                   val offField = EditText(this).apply {
                       hint = "المدة بين كل مرة (بالثواني) - ساعة = 3600"
                       inputType = InputType.TYPE_CLASS_NUMBER
-                      setText("60")
+                      setText("3600")
                   }
                   val start = Button(this).apply { text = "ابدأ" }
                   val stop = Button(this).apply { text = "إيقاف" }
 
-                  access.setOnClickListener {
-                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  grant.setOnClickListener {
+                      try {
+                          if (Shizuku.pingBinder()) Shizuku.requestPermission(1001) else refresh()
+                      } catch (e: Throwable) {
+                          refresh()
+                      }
                   }
                   start.setOnClickListener {
-                      val svc = AirplaneService.instance
-                      if (svc == null) {
-                          Toast.makeText(this, "فعّل الخدمة أولاً من إعدادات إمكانية الوصول", Toast.LENGTH_LONG).show()
+                      if (!ready()) {
+                          refresh()
+                          Toast.makeText(this, "Shizuku غير جاهز", Toast.LENGTH_LONG).show()
                       } else {
                           val onSec = onField.text.toString().toLongOrNull() ?: 5L
-                          val offSec = offField.text.toString().toLongOrNull() ?: 60L
-                          svc.start(onSec, offSec)
-                          Toast.makeText(this, "بدأ التشغيل", Toast.LENGTH_SHORT).show()
+                          val offSec = offField.text.toString().toLongOrNull() ?: 3600L
+                          startForegroundService(
+                              Intent(this, ToggleService::class.java)
+                                  .putExtra("on", onSec)
+                                  .putExtra("off", offSec)
+                          )
                       }
                   }
                   stop.setOnClickListener {
-                      AirplaneService.instance?.stop()
-                      Toast.makeText(this, "تم الإيقاف", Toast.LENGTH_SHORT).show()
+                      startService(Intent(this, ToggleService::class.java).setAction("STOP"))
                   }
 
-                  root.addView(info)
-                  root.addView(access)
+                  root.addView(status)
+                  root.addView(grant)
                   root.addView(onField)
                   root.addView(offField)
                   root.addView(start)
                   root.addView(stop)
                   setContentView(root)
+                  refresh()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+
+              override fun onDestroy() {
+                  try {
+                      Shizuku.removeRequestPermissionResultListener(listener)
+                  } catch (e: Throwable) {
+                  }
+                  super.onDestroy()
               }
           }
           EOF
 
-          cat > app/src/main/java/com/example/airplanetoggler/AirplaneService.kt <<'EOF'
+          cat > app/src/main/java/com/example/airplanetoggler/ToggleService.kt <<'EOF'
           package com.example.airplanetoggler
 
-          import android.accessibilityservice.AccessibilityService
+          import android.app.*
+          import android.content.Context
           import android.content.Intent
           import android.os.Handler
+          import android.os.IBinder
           import android.os.Looper
-          import android.view.accessibility.AccessibilityEvent
-          import android.view.accessibility.AccessibilityNodeInfo
+          import android.os.PowerManager
           import android.widget.Toast
+          import kotlin.concurrent.thread
+          import rikka.shizuku.Shizuku
 
-          class AirplaneService : AccessibilityService() {
+          class ToggleService : Service() {
 
-              companion object {
-                  var instance: AirplaneService? = null
-              }
+              @Volatile private var token = 0
+              private var wl: PowerManager.WakeLock? = null
+              private val ui = Handler(Looper.getMainLooper())
 
-              private val handler = Handler(Looper.getMainLooper())
-              private var running = false
-              private var airplaneOn = false
-              private var onSec = 5L
-              private var offSec = 60L
-
-              private val tick = object : Runnable {
-                  override fun run() {
-                      if (!running) return
-                      toggle()
-                      airplaneOn = !airplaneOn
-                      val delay = if (airplaneOn) onSec else offSec
-                      handler.postDelayed(this, delay * 1000)
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == "STOP") {
+                      stopSelf()
+                      return START_NOT_STICKY
                   }
-              }
+                  val onSec = intent?.getLongExtra("on", 5L) ?: 5L
+                  val offSec = intent?.getLongExtra("off", 3600L) ?: 3600L
 
-              override fun onServiceConnected() {
-                  instance = this
-              }
+                  val channelId = "toggle"
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(
+                      NotificationChannel(channelId, "Airplane Toggler", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val notification = Notification.Builder(this, channelId)
+                      .setContentTitle("Airplane Toggler يعمل")
+                      .setContentText("تبديل وضع الطائرة تلقائياً")
+                      .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                      .setOngoing(true)
+                      .build()
+                  startForeground(1, notification)
 
-              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
-
-              override fun onInterrupt() {}
-
-              override fun onUnbind(intent: Intent?): Boolean {
-                  running = false
-                  handler.removeCallbacksAndMessages(null)
-                  instance = null
-                  return super.onUnbind(intent)
-              }
-
-              fun start(on: Long, off: Long) {
-                  handler.removeCallbacksAndMessages(null)
-                  onSec = on
-                  offSec = off
-                  running = true
-                  handler.post(tick)
-              }
-
-              fun stop() {
-                  running = false
-                  handler.removeCallbacksAndMessages(null)
-                  if (airplaneOn) {
-                      toggle()
-                      airplaneOn = false
+                  if (wl == null) {
+                      wl = (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                          .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "airplane:loop")
+                          .apply { acquire() }
                   }
-              }
 
-              private fun toggle() {
-                  performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS)
-                  handler.postDelayed({ clickTile(0) }, 1200)
-              }
-
-              private fun clickTile(attempt: Int) {
-                  if (findAndClick()) {
-                      handler.postDelayed({ performGlobalAction(GLOBAL_ACTION_BACK) }, 800)
-                  } else if (attempt < 3) {
-                      handler.postDelayed({ clickTile(attempt + 1) }, 700)
-                  } else {
-                      performGlobalAction(GLOBAL_ACTION_BACK)
-                      Toast.makeText(
-                          this,
-                          "لم أجد زر وضع الطائرة. أضفه إلى الإعدادات السريعة",
-                          Toast.LENGTH_LONG
-                      ).show()
-                  }
-              }
-
-              private fun findAndClick(): Boolean {
-                  val keys = listOf("Airplane", "Flight mode", "الطائرة", "الطيران")
-                  for (w in windows) {
-                      val rootNode = w.root ?: continue
-                      for (k in keys) {
-                          val nodes = rootNode.findAccessibilityNodeInfosByText(k)
-                          for (n in nodes) {
-                              var c: AccessibilityNodeInfo? = n
-                              while (c != null && !c.isClickable) c = c.parent
-                              if (c != null && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                                  return true
-                              }
+                  val my = ++token
+                  thread {
+                      var warned = false
+                      while (token == my) {
+                          val ok = sh("cmd connectivity airplane-mode enable")
+                          if (!ok && !warned) {
+                              warned = true
+                              toast("فشل التنفيذ. تأكد أن Shizuku يعمل")
                           }
+                          if (!pause(onSec, my)) break
+                          sh("cmd connectivity airplane-mode disable")
+                          if (!pause(offSec, my)) break
                       }
                   }
-                  return false
+                  return START_STICKY
               }
+
+              private fun pause(sec: Long, my: Int): Boolean {
+                  var left = sec * 1000
+                  while (left > 0 && token == my) {
+                      Thread.sleep(minOf(left, 500L))
+                      left -= 500
+                  }
+                  return token == my
+              }
+
+              private fun toast(msg: String) {
+                  ui.post { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+              }
+
+              private fun sh(cmd: String): Boolean = try {
+                  val m = Shizuku::class.java.getDeclaredMethod(
+                      "newProcess",
+                      Array<String>::class.java,
+                      Array<String>::class.java,
+                      String::class.java
+                  )
+                  m.isAccessible = true
+                  val p = m.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+                  p.waitFor() == 0
+              } catch (e: Throwable) {
+                  false
+              }
+
+              override fun onDestroy() {
+                  token++
+                  val lock = wl
+                  wl = null
+                  thread {
+                      sh("cmd connectivity airplane-mode disable")
+                      lock?.release()
+                  }
+                  super.onDestroy()
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
           }
           EOF
 
